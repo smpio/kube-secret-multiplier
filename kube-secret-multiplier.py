@@ -50,14 +50,28 @@ def main():
     handler.handle()
 
 
-class SecretWatchThread(threading.Thread):
-    def __init__(self, queue, *, namespace, name):
+class WatchThread(threading.Thread):
+    def __init__(self, queue):
         super().__init__(daemon=True)
+        self.queue = queue
+
+    def run(self):
+        try:
+            return self.watch()
+        except Exception as e:
+            e.thread = self
+            self.queue.put(('exception', e))
+            raise e
+
+
+class SecretWatchThread(WatchThread):
+    def __init__(self, queue, *, namespace, name):
+        super().__init__(queue)
         self.queue = queue
         self.namespace = namespace
         self.name = name
 
-    def run(self):
+    def watch(self):
         w = kubernetes.watch.Watch()
         v1 = kubernetes.client.CoreV1Api()
 
@@ -75,13 +89,13 @@ class SecretWatchThread(threading.Thread):
             self.queue.put(('secret', secret))
 
 
-class NamespaceWatchThread(threading.Thread):
+class NamespaceWatchThread(WatchThread):
     def __init__(self, queue, *, match_regexp):
-        super().__init__(daemon=True)
+        super().__init__(queue)
         self.queue = queue
         self.match_re = re.compile(match_regexp)
 
-    def run(self):
+    def watch(self):
         w = kubernetes.watch.Watch()
         v1 = kubernetes.client.CoreV1Api()
 
@@ -112,6 +126,10 @@ class Handler:
         while True:
             etype, data = self.queue.get()
             getattr(self, f'handle_{etype}')(data)
+
+    def handle_exception(self, exc):
+        exc.thread.join()
+        sys.exit(1)
 
     def handle_secret(self, secret):
         self.secret = secret
