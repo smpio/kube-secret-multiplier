@@ -11,10 +11,11 @@ import threading
 
 import kubernetes.client
 import kubernetes.config
+from urllib3.exceptions import ReadTimeoutError
 
 log = logging.getLogger(__name__)
 
-# TODO: program doesn't terminate itself on exception in a thread
+WATCH_TIMEOUT = 1 * 60 * 60
 
 
 def main():
@@ -57,11 +58,20 @@ class WatchThread(threading.Thread):
 
     def run(self):
         try:
-            return self.watch()
+            return self.watch_infinitely()
         except Exception as e:
             e.thread = self
             self.queue.put(('exception', e))
             raise e
+
+    def watch_infinitely(self):
+        while True:
+            try:
+                self.watch()
+            except ReadTimeoutError:
+                log.info('Watch timeout')
+            else:
+                log.info('Watch connection closed')
 
 
 class SecretWatchThread(WatchThread):
@@ -75,9 +85,8 @@ class SecretWatchThread(WatchThread):
         w = kubernetes.watch.Watch()
         v1 = kubernetes.client.CoreV1Api()
 
-        while True:
-            for change in w.stream(v1.list_namespaced_secret, namespace=self.namespace):
-                self.handle_change(change)
+        for change in w.stream(v1.list_namespaced_secret, namespace=self.namespace, _request_timeout=WATCH_TIMEOUT):
+            self.handle_change(change)
 
     def handle_change(self, change):
         secret = change['object']
@@ -99,9 +108,8 @@ class NamespaceWatchThread(WatchThread):
         w = kubernetes.watch.Watch()
         v1 = kubernetes.client.CoreV1Api()
 
-        while True:
-            for change in w.stream(v1.list_namespace):
-                self.handle_change(change)
+        for change in w.stream(v1.list_namespace, _request_timeout=WATCH_TIMEOUT):
+            self.handle_change(change)
 
     def handle_change(self, change):
         name = change['object'].metadata.name
