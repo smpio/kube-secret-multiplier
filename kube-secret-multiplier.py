@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 
 import re
-import sys
 import copy
 import queue
-import signal
 import logging
 import argparse
-import threading
 
 import kubernetes.client
-import kubernetes.config
-from urllib3.exceptions import ReadTimeoutError
+
+from utils.kubernetes.config import configure
+from utils.signal import install_shutdown_signal_handlers
+from utils.kubernetes.watch import KubeWatcher, WatchEventType
+from utils.threading import SupervisedThread, SupervisedThreadGroup
 
 log = logging.getLogger(__name__)
-
-WATCH_TIMEOUT = 1 * 60 * 60
 
 
 def main():
     arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument('--master', help='kubernetes api server url')
     arg_parser.add_argument('--in-cluster', action='store_true', help='configure with in cluster kubeconfig')
     arg_parser.add_argument('--log-level', default='INFO')
     arg_parser.add_argument('--origin-namespace', required=True)
@@ -28,123 +27,84 @@ def main():
     args = arg_parser.parse_args()
 
     logging.basicConfig(format='%(levelname)s: %(message)s', level=args.log_level)
-
-    if args.in_cluster:
-        kubernetes.config.load_incluster_config()
-    else:
-        configuration = kubernetes.client.Configuration()
-        configuration.host = 'http://127.0.0.1:8001'
-        kubernetes.client.Configuration.set_default(configuration)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    configure(args.master, args.in_cluster)
+    install_shutdown_signal_handlers()
 
     q = queue.Queue()
-
-    secret_watch_thread = SecretWatchThread(q, namespace=args.origin_namespace, name=args.secret_name)
-    secret_watch_thread.start()
-
-    namespace_watch_thread = NamespaceWatchThread(q, match_regexp=args.destination_namespaces_regexp)
-    namespace_watch_thread.start()
-
-    handler = Handler(q)
-    handler.handle()
+    threads = SupervisedThreadGroup()
+    threads.add_thread(SecretWatchThread(q, namespace=args.origin_namespace, secret_name=args.secret_name))
+    threads.add_thread(NamespaceWatchThread(q, match_regex=args.destination_namespaces_regexp))
+    threads.add_thread(HandlerThread(q))
+    threads.start_all()
+    threads.wait_any()
 
 
-class WatchThread(threading.Thread):
-    def __init__(self, queue):
+class SecretWatchThread(SupervisedThread):
+    def __init__(self, queue, *, namespace, secret_name):
         super().__init__(daemon=True)
         self.queue = queue
-
-    def run(self):
-        try:
-            return self.watch_infinitely()
-        except Exception as e:
-            e.thread = self
-            self.queue.put(('exception', e))
-            raise e
-
-    def watch_infinitely(self):
-        while True:
-            try:
-                self.watch()
-            except ReadTimeoutError:
-                log.info('Watch timeout')
-            else:
-                log.info('Watch connection closed')
-
-
-class SecretWatchThread(WatchThread):
-    def __init__(self, queue, *, namespace, name):
-        super().__init__(queue)
-        self.queue = queue
         self.namespace = namespace
-        self.name = name
+        self.secret_name = secret_name
 
-    def watch(self):
+    def run_supervised(self):
         w = kubernetes.watch.Watch()
         v1 = kubernetes.client.CoreV1Api()
+        watcher = iter(KubeWatcher(v1.list_namespaced_secret, namespace=self.namespace))
 
-        for change in w.stream(v1.list_namespaced_secret, namespace=self.namespace, _request_timeout=WATCH_TIMEOUT):
-            self.handle_change(change)
-
-    def handle_change(self, change):
-        secret = change['object']
-
-        if secret.metadata.name != self.name:
-            return
-
-        if change['type'] != 'DELETED':
+        for event_type, secret in watcher:
+            if event_type == WatchEventType.DONE_INITIAL:
+                continue
+            if secret.metadata.name != self.secret_name:
+                continue
+            if event_type == WatchEventType.DELETED:
+                continue
             self.queue.put(('secret', secret))
 
 
-class NamespaceWatchThread(WatchThread):
-    def __init__(self, queue, *, match_regexp):
-        super().__init__(queue)
+class NamespaceWatchThread(SupervisedThread):
+    def __init__(self, queue, *, match_regex):
+        super().__init__(daemon=True)
         self.queue = queue
-        self.match_re = re.compile(match_regexp)
+        self.match_re = re.compile(match_regex)
 
-    def watch(self):
+    def run_supervised(self):
         w = kubernetes.watch.Watch()
         v1 = kubernetes.client.CoreV1Api()
+        watcher = iter(KubeWatcher(v1.list_namespace))
 
-        for change in w.stream(v1.list_namespace, _request_timeout=WATCH_TIMEOUT):
-            self.handle_change(change)
+        for event_type, ns in watcher:
+            if event_type == WatchEventType.DONE_INITIAL:
+                continue
 
-    def handle_change(self, change):
-        name = change['object'].metadata.name
+            name = ns.metadata.name
 
-        if not self.match_re.match(name):
-            return
-
-        if change['type'] == 'ADDED':
-            self.queue.put(('namespace', name))
-        elif change['type'] == 'DELETED':
-            self.queue.put(('namespace_deleted', name))
+            if not self.match_re.match(name):
+                continue
+            if event_type == WatchEventType.ADDED:
+                self.queue.put(('namespace_added', name))
+            if event_type == WatchEventType.DELETED:
+                self.queue.put(('namespace_deleted', name))
 
 
-class Handler:
+class HandlerThread(SupervisedThread):
     def __init__(self, queue):
+        super().__init__(daemon=True)
         self.queue = queue
         self.known_namespaces = set()
         self.secret = None
         self.api = kubernetes.client.CoreV1Api()
 
-    def handle(self):
+    def run_supervised(self):
         while True:
-            etype, data = self.queue.get()
-            getattr(self, f'handle_{etype}')(data)
-
-    def handle_exception(self, exc):
-        exc.thread.join()
-        sys.exit(1)
+            event_name, data = self.queue.get()
+            getattr(self, f'handle_{event_name}')(data)
 
     def handle_secret(self, secret):
         self.secret = secret
         for name in self.known_namespaces:
             self.update_secret_in_namespace(name)
 
-    def handle_namespace(self, name):
+    def handle_namespace_added(self, name):
         self.known_namespaces.add(name)
         if self.secret:
             self.update_secret_in_namespace(name)
@@ -177,16 +137,6 @@ class Handler:
                 raise
             log.info('Conflict! Already created by somebody, requeue')
             self.queue.put(('namespace', namespace))
-
-
-def shutdown(signum, frame):
-    """
-    Shutdown is called if the process receives a TERM signal. This way
-    we try to prevent an ugly stacktrace being rendered to the user on
-    a normal shutdown.
-    """
-    log.info("Shutting down")
-    sys.exit(0)
 
 
 if __name__ == '__main__':
